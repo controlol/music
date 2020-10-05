@@ -1,883 +1,1143 @@
-const router = require('express').Router();
-let smloadr = require('../smloadr/smloadr-class');
-const fs = require('fs');
-const path = require('path');
-let archiver = require('archiver');
-let sanitize = require('sanitize-filename');
-let querystring = require('querystring');
-const axios = require('axios');
 const Promise = require('bluebird');
-const {mongoError, downloadError, fsError} = require('../utils/error');
-// const sqlite3 = require('sqlite3').verbose(); for opening plex database and getting the "key" of a media file based on the path/file location
+const sanitize = require('sanitize-filename');
+const id3Writer = require('./libs/browser-id3-writer');
+const flacMetadata = require('./libs/flac-metadata');
+const fs = require('fs');
+const stream = require('stream');
+const nodePath = require('path');
+const {downloadError, XHRerror} = require('../utils/error')
+const querystring = require('querystring')
+const EncryptionService = require('./libs/EncryptionService')
+let encryptionService = new EncryptionService();
 
-const SongMatch = require('../models/songMatch.model');
-const Playlist = require('../models/playlist.model');
+const axios = require('axios').default;
+const tough = require('tough-cookie');
+const axiosCookieJarSupport = require('axios-cookiejar-support').default;
+
+axiosCookieJarSupport(axios);
 
 const CONFIG = require('../../src/config.json');
-const { resolve } = require('path');
 const concurrentDownloads = CONFIG.concurrentDownloads;
-const optimizedFS = CONFIG.optimizedFS
+const optimizedFS = CONFIG.optimizedFS;
 
-const baseurl = 'http://localhost:8888'; //baseurl for API queries
+const unofficialApiUrl = 'https://www.deezer.com/ajax/gw-light.php?';
 
-let currentlySyncingPlaylists = false;
+let DOWNLOAD_DIR = '/music/';
 
-//spotify API limits
-const spotifyLimit = 100;
+const musicQualities = {
+    MP3_128: {
+        id: 1,
+        name: 'MP3 - 128 kbps',
+        aproxMaxSizeMb: '100'
+    },
+    MP3_320: {
+        id: 3,
+        name: 'MP3 - 320 kbps',
+        aproxMaxSizeMb: '200'
+    },
+    FLAC: {
+        id: 9,
+        name: 'FLAC - 1411 kbps',
+        aproxMaxSizeMb: '700'
+    },
+    MP3_MISC: {
+        id: 0,
+        name: 'User uploaded song'
+    }
+};
 
-//smloadr settings
-const rootFolder = smloadr.setDownloadPath(CONFIG.downloadLocation);
-const arl = CONFIG.arl;
-smloadr.createNewToken(arl)
-.then(msg => { console.log(msg) })
+let selectedMusicQuality = musicQualities.MP3_320;
 
-const quality = CONFIG.quality;
-smloadr.setMusicQuality(quality)
-.then(result => { console.log(result) })
+const delay = t => new Promise(resolve => setTimeout(resolve, t));
 
-// download a single track, required: deezerID 
-router.route('/track').get( async (req, res) => {
-  let deezerID = req.query.deezerID ? req.query.deezerID : null,
-      playlistID = req.query.playlistID ? req.query.playlistID : null;
-
-  if (!deezerID || typeof optimizedFS !== "boolean") return res.json({error: "Missing parameter"});
-
-  if (optimizedFS && !playlistID) return res.json({error: "Can not download single track with optimizedFS enabled"}); // this needs to be possible
-  
-  try {
-    await axios.get("https://deezer.com/us/track/"+deezerID) // try if the track is available
-
-    let resMatch = await SongMatch.findOne({deezerID})
-
-    if (!playlistID) { // download a track without a playlistid
-      const exists = await doesTrackExist(resMatch);
-
-      if (exists) return res.json({success: "Track already exists"});
-
-      let msg;
-
-      if (optimizedFS) {
-        msg = await downloadForPlex(deezerID, resMatch)
-      } else {
-        msg = await downloadTrack(deezerID)
-      }
-
-      msg += "- No playlist?"
-      return res.json({success: msg})
+let smloadrClass = class {
+    constructor() {
+        this.tokens = [] // array containing the arl, axios config, and unofficialApiQueries
+        this.queue = []; // array of objects containing the track_id and associated arl
+        this.active = [] // array with active downloads from the queue, it will also contain track info
     }
 
-    if (!resMatch) throw new mongoError("no result", "Songmatch", deezerID); // if no playlistID was provided we dont NEED the resMatch
+    /**
+     * Change the download location, default /music
+     * 
+     * @param {String} downloadLocation path to the download location
+     */
+    setDownloadPath(downloadLocation) {
+        if (downloadLocation.charAt(downloadLocation.length-1) !== "/") downloadLocation += '/';
 
-    let resPlaylist = await Playlist.findOne({playlistID})
-    if (!resPlaylist) throw new mongoError("no result", "Playlist", playlistID);
-    
-    playlistTitle = resPlaylist.playlistTitle;
+        DOWNLOAD_DIR = downloadLocation;
 
-    let exists = await doesTrackExist(resMatch, playlistTitle)
-    if (exists) return res.json({success: "Track already exists"});
-
-    let msg;
-
-    if (optimizedFS) { // download track to ./artist/album folder
-      msg = await downloadForPlex(deezerID, resMatch)
-    } else { // download track to playlist folder
-      msg = await downloadTrack(deezerID, playlistTitle, resMatch)
+        return DOWNLOAD_DIR;
     }
 
-    resPlaylist.lastDownload = Date();
-       
-    resPlaylist.save()
-    .then(() => { return res.json({success: msg}) })
-    .catch(err => { throw new mongoError("update", "Playlist", "lastDownload") })
-  } catch (err) {
-    //console.error(err)
-
-    if (err instanceof mongoError) { // mongo error
-      if (err.message === "no result") return res.json({error: `could not find "${err.key}" in ${err.collection}`})
-      if (err.message === "update") return res.json({error: `could not update "${err.key}" in ${err.collection}`})
-      if (err.message === "save") return res.json({error: `could not save new document ${err.collection}`})
-
-    } else if (err instanceof fsError) {
-      return res.json({error: error.message})
-
-    } else if (err instanceof downloadError) {
-      if (err.message.includes("track not available")) {
-        setBadMatch(deezerID)
-        .then(() => { return res.json({error: `Track ${deezerID} is not available`}) })
-        .catch(err => { return res.json({error: `Track ${deezerID} is not available`}) })
-      } else {
-        return res.json({error: err})
-      }
-    } else if (err.isAxiosError) {
-      //res.json({error: "axios error "+err.response.status})
-      setBadMatch(deezerID)
-      .then(() => { return res.json({error: `Track ${deezerID} is not available`}) })
-      .catch(err => {
-        throw err
-        res.json({error: `Track ${deezerID} is not available`})
-      })
-    } else {
-      console.error(err)
-      return res.json({error: "unknown error"})
-    }
-  }
-})
-
-// used to download a zip file of all tracks in a playlist
-router.route('/playlist').get((req, res) => {
-  let playlistID = req.query.playlistID;
-  let optimizedFS = CONFIG.optimizedFS;
-
-  Playlist.findOne({playlistID})
-  .then(resPlaylist => {
-    if (!result) throw new mongoError("no result", "Playlist", playlistID);
-
-    let archivePath = path.join(rootFolder, resPlaylist.playlistTitle+".zip");
-    playlistTitle = optimizedFS === false ? resPlaylist.playlistTitle : false; 
-
-    let archiveExists = fs.access(archivePath, err => {
-      if (err) {
-        return false
-      } else {
-        return true
-      }
-    })
-
-    if (!CONFIG.allowUploads) {
-      return res.json({success: "Uploading to system not allowed"})
-    } else if (resPlaylist.lastZip > resPlaylist.lastDownload && archiveExists) { //fs.existsSync(archivePath)
-      console.log(`Archive ${playlistTitle} already exists`)
-      return res.download(archivePath);
-    } else {
-      let tracks = [];
-
-      Promise.map(resPlaylist.tracks, spotifyID => {
-        return SongMatch.findOne({spotifyID})
-        .then(resMatch => {
-          for (let i = 0; i < resMatch.location.length; i++) {
-            fs.access(resMatch.location[i], err => {
-              if (!err) {
-                tracks.push(resMatch.location[i])
-                return resolve()
-              }
-            })
-          }
-        })
-        .catch(() => { return resolve() })
-      })
-
-      /*let tasks = resPlaylist.tracks.map(spotifyID => {
+    /**
+     * Change the music quality, default MP3_320
+     * 
+     * @param {String} quality The desired quality, MP3_128 - MP3_320 - FLAC
+     */
+    setMusicQuality(quality) {
         return new Promise(resolve => {
-          SongMatch.findOne({spotifyID})
-          .then(resMatch => {
-            tracks.push(...resMatch.location);
-            resolve()
-          })
-        })
-      })
-
-      Promise.all(tasks)*/
-      .then(() => {
-        createArchive(playlistTitle, tracks, archivePath)
-        .then(archivePath => {
-          resPlaylist.lastZip = Date();
-
-          resPlaylist.save()
-          .then(() => { return res.download(archivePath) })
-          .catch(err => {
-            console.error(err);
-            return res.json({error: "Could not update lastZip date"});
-          })
-        })
-        .catch(err => {
-          console.error(err)
-          return res.json({error: "could not create playlist"})
-        })
-      })
-    }
-  })
-  .catch(err => {
-    if (err !== "no result") console.error(err);
-    return res.json({error: "Could not find playlist"});
-  })
-});
-
-// update playlist settings; sync, removedTracks
-router.route('/update-playlist-settings').post((req, res) => {
-  let playlistID = req.body.playlistID,
-      sync = req.body.sync,
-      removedTracks = req.body.removedTracks;
-
-  if (typeof playlistID === "undefined" || typeof sync === "undefined" || typeof removedTracks === "undefined") return res.json({error: "missing parameter"});
-
-  Playlist.findOne({playlistID})
-  .then(result => {
-    if (!result) throw "no result";
-
-    result.sync = sync;
-    result.removedTracks = removedTracks;
-
-    result.save()
-    .then(() => { return res.json({success: "updated playlist settings"}) })
-    .catch(err => {
-      console.error("could not update playlist settings", err)
-      return res.json({error: "could not update playlist settings"})
-    })
-  })
-  .catch(err => {
-    if (err !== "no result") console.error(err)
-    return res.json({error: "no result"})
-  })
-});
-
-// return the settings for a playlist; sync, removedTracks
-router.route('/get-playlist-settings').get((req, res) => {
-  let playlistID = req.query.playlistID;
-
-  Playlist.findOne({playlistID})
-  .then(result => {
-    if (!result) throw "no result";
-
-    let sync = false,
-        removedTracks = result.removedTracks;
-
-    if (result.sync) sync = true;
-
-    return res.json({sync, removedTracks})
-  })
-  .catch(err => {
-    if (err !== "no result") console.error(err)
-    return res.json({error: "no result"})
-  })
-});
-
-/**
- * check if the track was already downloaded
- * 
- * @param {Object} resMatch mongoose query result
- * @param {String} playlistTitle title of the playlist
- */
-let doesTrackExist = (resMatch, playlistTitle = undefined) => {
-  return new Promise(resolve => {
-    if (!resMatch) return resolve(false);
-
-    if (optimizedFS) {
-      fs.access(resMatch.location[0], err => {
-        if (!err) {
-          return resolve(true)
-        } else {
-          resMatch.location = undefined; // Delete the location array from the mongo document
-
-          resMatch.save()
-          .then(() => {return resolve(false) })
-          .catch(() => {return resovle(false) })
-        }
-      })
-    }
-
-    let exists = false;
-    let locations = [];
-
-    Promise.map(resMatch.location, (location, index) => {
-      return new Promise(resolve => {
-        if (locations.includes(location)) {
-          resMatch.location.splice(index, 1) // splice location if it is a double
-          return resolve()
-        } else {
-          locations.push(location)
-        }
-
-        if (location.includes("/"+playlistTitle+"/") || !playlistTitle) {
-          fs.access(location, err => {
-            if (err) {
-              resMatch.location.splice(index, 1)  // splice location if the track was removed from system
-            } else {
-              exists = true 
+            switch (quality) {
+                case 'MP3_128':
+                    selectedMusicQuality = musicQualities.MP3_128;
+                    resolve(`set music quality to ${selectedMusicQuality.name}`);
+                    break;
+                case 'MP3_320':
+                    selectedMusicQuality = musicQualities.MP3_320;
+                    resolve(`set music quality to ${selectedMusicQuality.name}`);
+                    break;
+                case 'FLAC':
+                    selectedMusicQuality = musicQualities.FLAC;
+                    resolve(`set music quality to ${selectedMusicQuality.name}`);
+                    break;
+                default:
+                    resolve(`no valid music quality was given.\nvalid options: MP3_128, MP3_320, FLAC\ndefaulted to ${selectedMusicQuality.name}`);
             }
-            resolve()
-          })
-        } else {
-          resolve() 
+        })
+    }
+
+    /**
+     * Get a cid for a unofficial api request.
+     *
+     * @return {Number}
+     */
+    getApiCid() {
+        return Math.floor(1e9 * Math.random());
+    }
+
+    /**
+     * Replaces multiple whitespaces with a single one.
+     *
+     * @param {String} string
+     * @returns {String}
+     */
+    multipleWhitespacesToSingle(string) {
+        return string.replace(/[ _,]+/g, ' ');
+    }
+
+    /**
+     * Replaces multiple whitespaces with a single one.
+     *
+     * @param {String} fileName
+     * @returns {String}
+     */
+    sanitizeFilename(fileName) {
+        fileName = fileName.replace('/', '-');
+
+        return sanitize(fileName);
+    }
+
+    /**
+     * remove Album Art from system
+     *
+     * @param {String} albumCoverSavePath
+     */
+    removeDownloadedArt(albumCoverSavePath) {
+        if (albumCoverSavePath && fs.existsSync(albumCoverSavePath)) {
+            fs.unlinkSync(albumCoverSavePath);
         }
-      })
-    }, {concurrency: 1})
-    .then(() => {
-      resMatch.save() // update location array in mongo, all duplicates and removed tracks should have been spliced/removed
-      .then(() => { return resolve(exists) })
-      .catch(() => { return resolve(exists) })
-    })
-  })
-}
-
-/**
- * create a archive for a folder
- * 
- * @param {String} playlistTitle 
- * @param {Array} tracks 
- * @param {String} archivePath 
- */
-let createArchive = (playlistTitle, tracks, archivePath) => {
-  let output = fs.createWriteStream(archivePath);
-
-  var archive = archiver('zip', {
-    zlib: { level: 9 } // Sets the compression level.
-  });
-
-  return new Promise((resolve, reject) => {
-    // listen for all archive data to be written
-    // 'close' event is fired only when a file descriptor is involved
-    output.on('close', function() {
-      console.log(archive.pointer() + ' total bytes');
-      return resolve(archivePath);
-    });
-
-    // This event is fired when the data source is drained no matter what was the data source.
-    // It is not part of this library but rather from the NodeJS Stream API.
-    // @see: https://nodejs.org/api/stream.html#stream_event_end
-    output.on('end', function() {
-      console.log('Data has been drained');
-      return resolve(archivePath)
-    });
-
-    // good practice to catch warnings (ie stat failures and other non-blocking errors)
-    archive.on('warning', function(err) {
-      if (err.code === 'ENOENT') {
-        // log warning
-      } else {
-        // throw error
-        reject(err)
-        throw err;
-      }
-    });
-
-    // good practice to catch this error explicitly
-    archive.on('error', function(err) {
-      reject(err)
-      throw err;
-    });
-
-    // pipe archive data to the response
-    archive.pipe(output);
-
-    if (playlistTitle) { // archive a folder
-      archive.directory(path.join(rootFolder, playlistTitle), false);
-      archive.finalize();
-    } else { // archive seperate tracks
-      let tasks = tracks.map(location => {
-        return new Promise(resolve => {
-          fs.access(location, err => {
-            if (err) {
-              console.log(location, "Could not be found")
-            } else {
-              archive.file(location, {name: path.basename(location)})
-            }
-            return resolve()
-          })
-        })
-      })
-
-      Promise.all(tasks)
-      .then(() => { archive.finalize() })
+        return;
     }
-  });
-}
 
-/**
- * move a file
- * 
- * @param {String} trackLocation 
- * @param {String} newTrackLocation 
- */
-let moveToPlaylist = (trackLocation, newTrackLocation) => {
-  return new Promise((resolve, reject) => {
-    fs.access(trackLocation , err => {
-      if (err) {
-        throw new fsError(`could not move ${trackLocation}`);
-      } else {
-        fs.rename(trackLocation, newTrackLocation, (err) => {
-          if (err) console.error(err);
-          return resolve();
-        })
-      }
-    })
-  })
-}
+    /**
+     * Create directories of the given path if they don't exist.
+     *
+     * @param {String} filePath
+     * @return {boolean}
+     */
+    ensureDir(filePath) {
+        const dirName = nodePath.dirname(filePath);
 
-/**
- * download track using smloadr lib 
- * the tracks will be stored in ./artist/album
- * the location of the track is stored in mongoDB
- * 
- * @param {String} deezerID 
- * @param {Object} resMatch result of mongoDB query
- */
-let downloadForPlex = (deezerID, resMatch) => {
-  return new Promise( async (resolve, reject) => {
-    try {
-      const msg = await smloadr.startDownload(deezerID, arl)
-
-      if (msg.saveFilePath) {//If the song was already downloaded it won't return a filePath
-        if (!resMatch) return resolve(msg.msg)  
-      
-        resMatch.location = msg.saveFilePath
-
-        resMatch.save()
-        .then(() => { return resolve(msg.msg) })
-        .catch(err => { throw new mongoError("update", "Songmatch", "location") })
-      } else {
-        return resolve(msg.msg);
-      }
-    } catch (err) {
-      return reject(err);
-    }
-  })
-}
-
-/**
- * download a track using the smloadr lib and move it to the correct folder based on playlistTitle
- * the location is stored in mongoDB
- * 
- * @param {String} deezerID 
- * @param {String} playlistTitle 
- * @param {Object} resMatch result from mongoDB query
- */
-let downloadTrack = (deezerID, playlistTitle = null, resMatch = null) => {
-  return new Promise( async (resolve, reject) => {
-    try {
-      const msg = await smloadr.startDownload(deezerID, arl)
-
-      if (msg.saveFilePath && playlistTitle) { // if a playlisttitle was given the file should be moved and stored in the DB, also if no saveFilePath was returned it was already downloaded 
-        let trackLocation = msg.saveFilePath;
-        let playlistLocation = path.join(path.dirname(msg.saveFilePath), playlistTitle);
-        let newTrackLocation = path.join(playlistLocation, path.basename(msg.saveFilePath));
-
-        await createNewFolder(playlistLocation)
-        await moveToPlaylist(trackLocation, newTrackLocation)
-
-        if (!resMatch) return resolve(msg.msg);
-
-        resMatch.location = resMatch.location ? [...resMatch.location, newTrackLocation] : newTrackLocation;
-        resMatch.save()
-        .then(() => {
-          return resolve(msg.msg);
-        })
-        .catch(()=> {
-          throw new mongoError("update", "Songmatch", "location")
-        })
-      } else {
-        return resolve(msg.msg);
-      }
-    } catch (err) {
-      return reject(err)
-    }
-  })
-}
-
-let createNewFolder = (folder) => {
-  return new Promise((resolve, reject) => {
-    fs.mkdir(folder, {recursive: true, mode: 0o666}, err => {
-      if (err) {
-        throw new fsError(`could not create ${folder}`)
-      } else {
-        return resolve()
-      }
-      /* possibly needed on windows but unnecessary in linux
-         mode option in fs.mkdir is not supported on windows
-      fs.chmod(folder, 0o666, err => {
-        if (err) {
-          reject(err)
-        } else {
-          resolve()
+        if (fs.existsSync(dirName)) {
+            return true;
         }
-      })*/
-    })
-  })
-}
 
-// some day this function will be used to track or immediately add the song to plex 
-// also requires sqlite3 library to connect to plex database
-let addToPlexPlaylist = () => {
-  let db = new sqlite3.Database('./db/chinook.db');
-
-  let sql = `SELECT id file FROM media_parts WHERE file LIKE '%Bootlegs%' ORDER BY id`;
-
-  db.all(sql, [], (err, rows) => {
-    if (err) {
-      throw err;
+        this.ensureDir(dirName);
+        fs.mkdirSync(dirName);
     }
-    rows.forEach((row) => {
-      console.log(row);
-    });
-  });
 
-  // close the database connection
-  db.close();
-}
+    /**
+     * Calculate the URL to download the track.
+     *
+     * @param {Object} trackInfos
+     * @param {Number} trackQuality
+     *
+     * @returns {String}
+     */
+    getTrackDownloadUrl(trackInfos, trackQuality) {
+        const cdn = trackInfos.MD5_ORIGIN[0];
 
-let setBadMatch = (deezerID) => {
-  console.warn("setting badmatch", deezerID)
-  return new Promise((resolve, reject) => {
-      SongMatch.findOne({deezerID})
-      .then(result => {
-        if (!result) throw new mongoError("no result", "Songmatch", deezerID)
+        return 'https://e-cdns-proxy-' + cdn + '.dzcdn.net/mobile/1/' + encryptionService.getSongFileName(trackInfos, trackQuality);
+    }
 
-        result.deezerID = "badmatch";
-        result.manual = true;
+    /**
+     * Capitalizes the first letter of a string
+     *
+     * @param {String} string
+     *
+     * @returns {String}
+     */
+    capitalizeFirstLetter(string) {
+        return string.charAt(0).toUpperCase() + string.slice(1);
+    }
 
-        result.save()
-        .then(() => { return resolve() })
-        .catch(err => { throw new mongoError("update", "Songmatch", "badmatch") })
-      })
-      .catch(err => { return reject(err) })
-  })
-}
-
-//!!! Here will start the functions for automatic downloading and syncronizing the selected playlists
-
-/**
- * synchronizes all playlists that have sync: true in mongodb
- * all tracks will be downloaded 
- * depending on removedTracks: {0,1,2} the removed tracks can be downloaded, deleted or kept
- */
-let syncPlaylist = () => {
-  if (currentlySyncingPlaylists) return; // do not synchronize again if the previous sync is still going, this should only happen when really large amounts of songs need to be synced
-  
-  currentlySyncingPlaylists = true;
-
-  Playlist.find({sync: true}) // find all playlists that need to be synced
-  .then(result => {
-    if (!result) throw "no playlists have to be synchronized"; // if the result is null there are no results, and thus no playlists should be synced
-
-    Promise.map(result, playlist => { // do the following for each playlist
-      return new Promise( async (resolve, reject) => {
-        const playlistID = playlist.playlistID;
-        //if (!playlist.playlistTitle.includes("40 Mix")) return resolve()
-
-        console.log(playlist.playlistTitle, "will be synced");
+    getTokenNR(arl) {
+        let nr = -1;
         
-        try {
-          const spotifyToken = await getSpotifyToken();
-          const tracks = await getPlaylistTracks(playlistID, spotifyToken);
-          const playlistTitle = await getPlaylistTitle(playlistID, spotifyToken);
-          
-          await storePlaylistToDB(tracks, playlistTitle, playlistID)
-          await matchMultipleTracks(tracks, spotifyToken)
+        this.tokens.forEach((token, index) => { if (token.arl === arl) nr = index })
 
-          await Promise.map(tracks, track => sendTrackToAPI(track, playlistID, playlistTitle), {concurrency: concurrentDownloads})
+        return nr;
+    }
 
-          if (playlist.removedTracks === 1) { // download removed tracks
-            await Promise.map(playlist.deletedTracks, track =>  sendTrackToAPI(track, playlistID), { concurrency: concurrentDownloads })
-          } else if (playlist.removedTracks === 2) { // delete removed tracks
-            await deleteRemovedTracks(playlistID)
-            console.log(playlistTitle, "has been downloaded")
-          } 
+    getActiveNR(track_id) {
+        let nr = -1;
+        
+        this.active.forEach((track, index) => { if (track.track_id === track_id) nr = index })
 
-          return resolve()
-        } catch (err) {
-          return reject(err)
+        return nr;
+    }
+
+    createNewToken(arl) {
+        if (this.getTokenNR(arl) !== -1) return "arl already exists"
+
+        const httpHeaders = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.129 Safari/537.36',
+            'cache-control': 'max-age=0',
+            'accept-language': 'en-US,en;q=0.9,en-US;q=0.8,en;q=0.7',
+            'accept-charset': 'utf-8,ISO-8859-1;q=0.8,*;q=0.7',
+            'content-type': 'text/plain;charset=UTF-8',
+            'cookie': 'arl=' + arl
         }
-      })
-    }, {concurrency: 1})
-    .then(() => {
-      currentlySyncingPlaylists = false;
-      console.log("Finished syncing all playlists!")
-      SongMatch.find({deezerID: "badmatch"})
-      .then(result => {
-        if (!result) throw "0 badmatch tracks"
 
-        console.log(result.length, "badmatch tracks")
-      })
-      .catch(err => { console.error(err) })
-    })
-  })
-  .catch(err => {
-    currentlySyncingPlaylists = false;
-    if (err !== "no result") console.error(err)
-  })
-}
+        const defaultToken = {
+            arl,
+            config: {
+                jar: new tough.CookieJar(),
+                withCredentials: true,
+                headers: httpHeaders
+            },
+            unofficialApiQueries: {
+                api_version: '1.0',
+                api_token: '',
+                input: 3
+            }
+        }
 
-/**
- * delete all tracks that still exist on disk but were removed from playlist
- * 
- * @param {*} tracks 
- */
-let deleteRemovedTracks = (playlistID) => {
-  return new Promise(resolve => {
-    Playlist.findOne({playlistID})
-    .then(result => {
-      if (!result) throw "no result";
+        this.tokens.push(defaultToken)
 
-      let playlistTitle = result.playlistTitle;
+        return this.initAPI(this.tokens.length-1)
+    }
 
-      if (result.deletedTracks) {
-        Promise.map(result.deletedTracks, spotifyID => {
-          SongMatch.findOne({spotifyID})
-          .then(result => {
-            if (!result) throw "no result"
+    initAPI(token_nr) {
+        return new Promise((resolve, reject) => {
+            axios.get(unofficialApiUrl+querystring.stringify(Object.assign({}, this.tokens[token_nr].unofficialApiQueries, {method: 'deezer.getUserData', cid: this.getApiCid()})), this.tokens[token_nr].config)
+            .then(response => {
+                if (!response || Object.keys(response.data.error).length > 0) {
+                    throw response.data.error;
+                } else if (response.data.results.USER.USER_ID !== 0) {
+                    if (response.data.results && response.data.results.checkForm) {
 
-            let locationIndex = null;
-            result.location.filter((location, i) => {if (location.includes(playlistTitle)) locationIndex = i;}); // get the index of the location where the playlist title occurs
-            if (locationIndex !== null) {
-              let file = result.location[locationIndex]; // get the file location using locationIndex
-              fs.unlink(file, err => {
-                if (err) {
-                  console.error(err)
-                  return resolve()
+                        this.tokens[token_nr].unofficialApiQueries.api_token = response.data.results.checkForm;
+
+                        resolve("connected to API")
+                    } else {
+                        throw "no checkForm";
+                    }
+                } else {
+                    reject("wrong deezer credentials")
+                }
+            })
+            .catch(err => {
+                reject(new XHRerror("Could not initialize Deezer API", (err.response ? err.response.status : err)))
+            })
+        })
+    }
+
+    startDownload(track_id = null, arl = null) {
+        return new Promise(async (resolve, reject) => {
+            if (!track_id || !arl) throw "missing paramater"
+
+            this.queue.push({track_id, arl})
+
+            await this.waitQueue(track_id)
+
+            // push to active and pop from queue
+            this.active.push({track_id, arl})
+            this.queue.shift()
+            
+            console.log(track_id, "started downloading")
+            console.time(track_id)
+            this.processDownload(track_id)
+            .then(result => {
+                this.active.splice(this.getActiveNR(track_id), 1) // splice the finished track of the active array
+
+                console.timeEnd(track_id)
+                resolve(result)
+            })
+            .catch(err => {
+                this.active.splice(this.getActiveNR(track_id), 1) // splice the finished track of the active array
+
+                console.error(track_id, "could not be downloaded")
+                console.timeEnd(track_id)
+                reject(err)
+            })
+        })
+    }
+
+    /**
+     * check if a track is first in queue and active is lower than concurrentDownloads
+     * 
+     * @param {String} track_id the track id we want to know if it's ready to be queued
+     */
+    waitQueue(track_id) {
+        return new Promise(resolve => {
+            if (this.active.length < concurrentDownloads && this.queue[0].track_id === track_id) return resolve() // continue to process download
+            delay(100).then(() => {
+                this.waitQueue(track_id)
+                .then(() => { return resolve() })
+            })
+        })
+    }
+
+    processDownload(track_id, trackInfos = {}, albumInfos = {}, isAlternativeTrack = false) {
+        return new Promise(async (resolve, reject) => {
+            const nr = this.getActiveNR(track_id)
+            const token_nr = this.getTokenNR(this.active[nr].arl)
+
+            // first there should be something with alternative tracks??
+
+            try {
+                trackInfos = await this.getTrackInfos(track_id, token_nr)
+                let fileExtension = 'mp3'
+                let saveFilePath;
+
+                const trackQuality = this.getValidTrackQuality(trackInfos)
+
+                if (!trackQuality) return reject(new downloadError("quality not available"));
+
+                if (trackInfos.ALB_ID !== 0) {
+                    albumInfos = await this.getAlbumInfos(trackInfos.ALB_ID, token_nr)
+                    ////// wtf is this even. we cant do getAlbumInfos() if there is no album id
+                    // if (0 === trackInfos.ALB_ID) {
+                    //     const albumInfosOfficial = await this.getAlbumInfosOfficialApi(trackInfos.ALB_ID)
+
+                    //     albumInfos.TYPE = albumInfosOfficial.record_type;
+
+                    //     albumInfosOfficial.genres.data.forEach(albumGenre => { albumInfos.GENRES.push(albumGenre.name) });
+                    // }
+
+                    trackInfos.ALB_UPC = '';
+                    trackInfos.ALB_LABEL = '';
+                    trackInfos.ALB_NUM_TRACKS = '';
+                    trackInfos.ALB_NUM_DISCS = '';
+
+                    trackInfos.ALB_ART_NAME = trackInfos.ART_NAME;
+
+                    if (albumInfos.UPC) trackInfos.ALB_UPC = albumInfos.UPC;
+                    if (albumInfos.PHYSICAL_RELEASE_DATE && !trackInfos.ALB_RELEASE_DATE) trackInfos.ALB_RELEASE_DATE = albumInfos.PHYSICAL_RELEASE_DATE;
+                    if (albumInfos.SONGS && 0 < albumInfos.SONGS.data.length && albumInfos.SONGS.data[albumInfos.SONGS.data.length - 1].DISK_NUMBER) trackInfos.ALB_NUM_DISCS = albumInfos.SONGS.data[albumInfos.SONGS.data.length - 1].DISK_NUMBER;
+                    if (trackInfos.ALB_ART_NAME.trim().toLowerCase() === 'various') trackInfos.ALB_ART_NAME = 'Various Artists';
+                    if (albumInfos.LABEL_NAME) trackInfos.ALB_LABEL = albumInfos.LABEL_NAME;
+                    if (albumInfos.SONGS && albumInfos.SONGS.data.length) trackInfos.ALB_NUM_TRACKS = albumInfos.SONGS.data.length;
+
+                    if (!trackInfos.ARTISTS || 0 === trackInfos.ARTISTS.length) {
+                        trackInfos.ARTISTS = [{
+                            ART_ID: trackInfos.ART_ID,
+                            ART_NAME: trackInfos.ALB_ART_NAME,
+                            ART_PICTURE: trackInfos.ART_PICTURE
+                        }];
+                    }
+
+                    trackInfos.ALB_GENRES = albumInfos.GENRES;
+
+                    if (albumInfos.TYPE) trackInfos.ALB_RELEASE_TYPE = albumInfos.TYPE;
                 }
 
-                result.location.splice(locationIndex, 1);
-              
-                result.save()
-                .then(() => {
-                  console.log("deleted", file)
-                  return resolve()
+                let artistName = this.multipleWhitespacesToSingle(this.sanitizeFilename(trackInfos.ALB_ART_NAME));
+                if (artistName.trim() === '') artistName = 'Unknown artist';
+
+                let albumName = this.multipleWhitespacesToSingle(this.sanitizeFilename(trackInfos.ALB_TITLE));
+                if (albumName.trim() === '') albumName = 'Unknown album'; 
+                
+                if (trackQuality.id === musicQualities.FLAC.id) fileExtension = 'flac';
+
+                if (optimizedFS) {
+                    saveFilePath = nodePath.join(DOWNLOAD_DIR, artistName, albumName);
+                    let artistPath = nodePath.dirname(saveFilePath)
+
+                    //create artist folder if it does not exist
+                    if(!fs.existsSync(artistPath)) {
+                        fs.mkdirSync(artistPath);
+                        fs.chmodSync(artistPath, 0o666); //folders created by node are created by the user node was started with, I run my application with root so change permissions
+                    } 
+
+                    //create album folder if it does not exist
+                    if(!fs.existsSync(saveFilePath)) {
+                        fs.mkdirSync(saveFilePath);
+                        fs.chmodSync(saveFilePath, 0o666); //folders created by node are created by the user node was started with, I run my application with root so change permissions
+                    } 
+
+                    saveFilePath += "/";
+                } else {
+                    saveFilePath = DOWNLOAD_DIR;
+                }                    
+
+                saveFilePath += artistName + ' - ' + this.multipleWhitespacesToSingle(this.sanitizeFilename(trackInfos.SNG_TITLE_VERSION)) + '.' + fileExtension;
+
+                if (fs.existsSync(saveFilePath)) return resolve({msg: ", track already exists"}); // do not download again if the track already exists
+                
+                const decryptedTrackBuffer = await this.downloadTrack(trackInfos, trackQuality.id, saveFilePath, token_nr)         
+
+                // determine wether a alternative track or quality was used and add this to the download messsage
+                let downloadMessageAppend = '';
+
+                // if alternative track was downloaded
+                if (isAlternativeTrack && originalTrackInfos.SNG_TITLE_VERSION.trim().toLowerCase() !== trackInfos.SNG_TITLE_VERSION.trim().toLowerCase()) downloadMessageAppend = ' › Used "' + originalTrackInfos.ALB_ART_NAME + ' - ' + originalTrackInfos.SNG_TITLE_VERSION + '" as alternative';
+
+                if (trackQuality !== selectedMusicQuality) { // if alternative quality was used
+                    let selectedMusicQualityName = musicQualities[Object.keys(musicQualities).find(key => musicQualities[key] === selectedMusicQuality)].name;
+                    let trackQualityName = musicQualities[Object.keys(musicQualities).find(key => musicQualities[key] === trackQuality)].name;
+
+                    downloadMessageAppend += ' › Used "' + trackQualityName + '" because "' + selectedMusicQualityName + '" wasn\'t available';
+                }
+
+                //const successMessage = trackInfos.ALB_ART_NAME + ' - ' + trackInfos.SNG_TITLE_VERSION + downloadMessageAppend;
+
+                const albumCoverSavePath = await this.downloadAlbumCover(trackInfos, saveFilePath, token_nr)
+
+                if (!trackInfos.LYRICS || trackInfos.LYRICS_ID || 0 !== trackInfos.LYRICS_ID) trackInfos.LYRICS = await this.getTrackLyrics(trackInfos.SNG_ID, token_nr); // add better lyrics
+
+                await this.addTagsAndStore(decryptedTrackBuffer, trackInfos, saveFilePath, albumCoverSavePath)
+
+                this.removeDownloadedArt(albumCoverSavePath);
+
+                resolve({msg: downloadMessageAppend, saveFilePath})
+            } catch (err) {
+                const nr = this.getActiveNR(track_id)
+                const token_nr = this.getTokenNR(this.active[nr].arl)
+
+                if (err instanceof XHRerror) {
+                    if (err.message === "could not get TrackInfo") return reject(new downloadError("track not available"));
+                }
+
+                if (err instanceof downloadError) {
+                    if (err.message === "track not available" && trackInfos.FALLBACK && trackInfos.FALLBACK.SNG_ID && trackInfos.SNG_ID !== trackInfos.FALLBACK.SNG_ID && !isAlternativeTrack) {
+                        this.processDownload(trackInfos.FALLBACK.SNG_ID, trackInfos, albumInfos, true)
+                    } else if (err.message === "track not available" && !isAlternativeTrack) {
+                        this.getTrackAlternative(trackInfos, token_nr)
+                        .then(alternativeTrackInfos => {
+                            if (albumInfos.ALB_TITLE) albumInfos = {};
+
+                            this.processDownload(alternativeTrackInfos.SNG_ID, trackInfos, albumInfos, true)
+                            .then(msg => {
+                                console.log("downloaded alternative track")
+                                return resolve(msg);
+                            })
+                            .catch(() => { return reject(new downloadError("track not available")) })
+                        })
+                    } else {
+                        return reject(new downloadError("track not available"));
+                    }
+                }
+
+                return reject(err)
+            }
+        })
+    }
+
+    getTrackInfos(id, token_nr) {
+        return new Promise((resolve, reject) => {
+            axios.post(unofficialApiUrl+querystring.stringify(Object.assign({}, this.tokens[token_nr].unofficialApiQueries, {method: 'deezer.pageTrack', cid: this.getApiCid()})), {sng_id: id}, this.tokens[token_nr].config)
+            .then(async response => {
+                if (response && Object.keys(response.data.error).length === 0 && response.data.results && response.data.results.DATA) {
+                    let trackInfos = response.data.results.DATA;
+
+                    if (response.data.results.LYRICS) trackInfos.LYRICS = response.data.results.LYRICS;
+
+                    trackInfos.SNG_TITLE_VERSION = trackInfos.SNG_TITLE;
+
+                    if (trackInfos.VERSION) trackInfos.SNG_TITLE_VERSION = (trackInfos.SNG_TITLE + ' ' + trackInfos.VERSION).trim();
+
+                    //this.active[this.getActiveNR(id)].originalTrackInfos = trackInfos;
+                    return resolve(trackInfos)
+                } else if (response.data.error.VALID_TOKEN_REQUIRED) { // add a function to retry here with new api_token, but for now just error
+                    await this.initAPI(token_nr)
+
+                    this.getTrackInfos(id, token_nr)
+                    .then(trackInfos => { resolve(trackInfos) })
+                    .catch(err => { reject(err) })
+                } else {
+                    return reject(new XHRerror("could not get TrackInfo", response.status))
+                }
+            })
+            .catch(err => {
+                return reject(new XHRerror("could not get TrackInfo", err))
+            })
+        })
+    }
+
+    /**
+     * Get a downloadable track quality.
+     *
+     * FLAC > 320kbps > 128kbps
+     * 320kbps > FLAC > 128kbps
+     * 128kbps > 320kbps > FLAC
+     *
+     * @param {Object} trackInfos
+     *
+     * @returns {Object|Boolean}
+     */
+    getValidTrackQuality(trackInfos) {
+        if (trackInfos.FILESIZE_MP3_MISC === 0) {
+            return musicQualities.MP3_MISC;
+        }
+
+        if (selectedMusicQuality === musicQualities.FLAC) {
+            if (trackInfos.FILESIZE_FLAC !== 0) return musicQualities.FLAC;
+            if (trackInfos.FILESIZE_MP3_320 !== 0) return musicQualities.MP3_320;
+            if (trackInfos.FILESIZE_MP3_128 === 0) return musicQualities.MP3_128;
+            
+            return false;
+        }
+
+        if (selectedMusicQuality === musicQualities.MP3_320) {
+            if (trackInfos.FILESIZE_MP3_320 !== 0) return musicQualities.MP3_320;
+            if (trackInfos.FILESIZE_FLAC !== 0 ) return musicQualities.FLAC;
+            if (trackInfos.FILESIZE_MP3_128 !== 0) return musicQualities.MP3_128;
+            
+            return false;
+        }
+
+        if (selectedMusicQuality === musicQualities.MP3_128) {
+            if (trackInfos.FILESIZE_MP3_128 !== 0) return musicQualities.MP3_128;
+            if (trackInfos.FILESIZE_MP3_320 !== 0) return musicQualities.MP3_320;
+            if (trackInfos.FILESIZE_FLAC !== 0) return musicQualities.FLAC;
+            
+            return false;
+        }
+
+        return false;
+    }
+
+    /**
+     * Get infos of an album by id.
+     *
+     * @param {Number} id
+     * @param {Number} token_nr
+     */
+    getAlbumInfos(id, token_nr) {
+        return new Promise(resolve => {
+            return axios.post(unofficialApiUrl+querystring.stringify(Object.assign({}, this.tokens[token_nr].unofficialApiQueries, {method: 'deezer.pageAlbum', cid: this.getApiCid()})), {alb_id: id, lang: 'us', tab: 0}, this.tokens[token_nr].config)
+            .then(async response => {
+                if (response && Object.keys(response.data.error).length === 0 && response.data.results && response.data.results.DATA && response.data.results.SONGS) {
+                    let albumInfos = response.data.results.DATA;
+                    albumInfos.SONGS = response.data.results.SONGS;
+
+                    albumInfos.TYPE = 'album';
+                    albumInfos.GENRES = [];
+
+                    resolve(albumInfos);
+                } else if (response.error.VALID_TOKEN_REQUIRED) {
+                    await this.initAPI(token_nr)
+
+                    this.getAlbumInfos(id, token_nr)
+                    .then(albumInfos => { return resolve(albumInfos) })
+                    .catch(err => { return reject(err) })
+                } else { 
+                    return reject({}) 
+                }
+            })
+            .catch(() => { return reject({}) });
+        });
+    }
+
+    // /**
+    //  * Get infos of an album from the official api by id.
+    //  *
+    //  * @param {Number} id
+    //  */
+    // getAlbumInfosOfficialApi(id) {
+    //     return new Promise((resolve, reject) => {
+    //         return axios.get('https://api.deezer.com/album/' + id)
+    //         .then((albumInfos) => {
+
+    //             if (albumInfos && !albumInfos.data.error) {
+    //                 resolve(albumInfos.data);
+    //             } else {
+    //                 reject({statusCode: 404});
+    //             }
+    //         }).catch(() => {
+    //             reject({statusCode: 404});
+    //         });
+    //     });
+    // }
+
+    /**
+     * Download the track, decrypt it and write it to a file.
+     *
+     * @param {Object} trackInfos
+     * @param {Number} trackQualityId
+     * @param {String} saveFilePath
+     * @param {Number} token_nr
+     * @param {Number} numberRetry
+     */
+    downloadTrack(trackInfos, trackQualityId, saveFilePath, token_nr, numberRetry = 0) {
+        return new Promise((resolve, reject) => {
+            const trackDownloadUrl = this.getTrackDownloadUrl(trackInfos, trackQualityId);
+
+            // fix config
+            delete this.tokens[token_nr].config.data
+            let config = Object.assign({}, this.tokens[token_nr].config, {responseType: 'arraybuffer'})
+            config.headers = Object.assign({}, config.headers, {'Content-Type': 'audio/mpeg'})
+
+            axios.get(trackDownloadUrl, config)
+            .then(response => {
+                const decryptedTrackBuffer = encryptionService.decryptTrack(response.data, trackInfos);
+
+                return resolve(decryptedTrackBuffer);
+            })
+            .catch(err => {
+                if (403 === err.statusCode) {
+                    let maxNumberRetry = 1;
+
+                    if ((trackInfos.RIGHTS && 0 !== Object.keys(trackInfos.RIGHTS).length) || (trackInfos.AVAILABLE_COUNTRIES && trackInfos.AVAILABLE_COUNTRIES.STREAM_ADS && 0 < trackInfos.AVAILABLE_COUNTRIES.STREAM_ADS.length)) maxNumberRetry = 2;
+
+                    if (maxNumberRetry >= numberRetry) {
+                        numberRetry++;
+
+                        setTimeout(() => {
+                            this.downloadTrack(trackInfos, trackQualityId, saveFilePath, token_nr, numberRetry)
+                            .then((decryptedTrackBuffer) => { return resolve(decryptedTrackBuffer) })
+                            .catch(error => { return reject(error) })
+                        }, 1000);
+                    } else {
+                        return reject(new downloadError("track not available"));
+                    }
+                } else {
+                    return reject(new downloadError("track not available"));
+                }
+            });
+        });
+    }
+
+    /**
+     * Get lyrics of a track by id.
+     *
+     * @param {Number} id
+     * @param {Number} token_nr
+     */
+    getTrackLyrics(id, token_nr) {
+        return new Promise(resolve => {
+
+            return axios.post(unofficialApiUrl+querystring.stringify(Object.assign({}, this.tokens[token_nr].unofficialApiQueries, {method: 'song.getLyrics', cid: this.getApiCid()})), {sng_id: id}, this.tokens[token_nr].config)
+            .then(async response => {
+                if (response && 0 === Object.keys(response.data.error).length && response.data.results && response.data.results.LYRICS_ID) {
+                    let trackLyrics = response.data.results;
+
+                    resolve(trackLyrics);
+                } else if (response.data.error.VALID_TOKEN_REQUIRED) {
+                    await this.initAPI(token_nr);
+
+                    this.getTrackLyrics(id, token_nr)
+                    .then(trackLyrics => { return resolve(trackLyrics); })
+                    .catch(err => { return resolve(err) });
+                } else {
+                    return resolve(null);
+                }
+            }).catch(() => {
+                return resolve(null);
+            });
+        });
+    }
+
+    /**
+     * Download the album cover of a track.
+     *
+     * @param {Object} trackInfos
+     * @param {String} saveFilePath
+     * @param {Number} token_nr 
+     * @param {Number} numberRetry
+     */
+    downloadAlbumCover(trackInfos, saveFilePath, token_nr, numberRetry = 0) {
+        return new Promise(resolve => {
+            const albumCoverSavePath = saveFilePath.slice(0,-3) + 'jpg';
+            // check to make sure there is a cover for this album
+            if (!trackInfos.ALB_PICTURE) {
+                return resolve(null);
+            } else if (!fs.existsSync(albumCoverSavePath)) {
+                const albumCoverUrl = 'https://e-cdns-images.dzcdn.net/images/cover/' + trackInfos.ALB_PICTURE + '/1400x1400-000000-94-0-0.jpg';
+
+                // fix config
+                delete this.tokens[token_nr].config.data
+                let config = Object.assign({}, this.tokens[token_nr].config, {responseType: 'arraybuffer'})
+                config.headers = Object.assign({}, config.headers, {'Content-Type': 'image/jpeg'})
+
+                return axios.get(albumCoverUrl, config)
+                .then(response => {
+                    this.ensureDir(albumCoverSavePath);
+                    fs.writeFile(albumCoverSavePath, response.data, err => {
+                        if (err) return resolve(null);
+                        return resolve(albumCoverSavePath);
+                    });
                 })
                 .catch(err => {
-                  console.error("could not remove location from database", spotifyID, err)
-                  return resolve()
-                })
-              })
+                    if (403 === err.statusCode) {
+                        if (numberRetry > 3) {
+                            numberRetry++;
+
+                            setTimeout(() => {
+                                this.downloadAlbumCover(trackInfos, saveFilePath, token_nr, numberRetry)
+                                .then(albumCoverSavePath => { return resolve(albumCoverSavePath) })
+                                .catch(() => { return resolve(null) })
+                            }, 500);
+                        } else {
+                            return resolve(null);
+                        }
+                    } else {
+                        return resolve(null);
+                    }
+                });
+            } else {
+                resolve(albumCoverSavePath);
             }
-          })
-          .catch(err => {
-            if (err !== "no result") console.error("could not delete removed track", spotifyID, err);
-            return resolve()
-          })
-        }, {concurrency: 1})
-        .then(() => { return resolve() })
-      } else {
-        return resolve()
-      }
-    })
-    .catch(err => {
-      if (err !== "no result") console.error(err)
-      return resolve()
-    })
-  })
-}
+        });
+    }
 
-/**
- * match all tracks in the array (useful for playlists)
- * 
- * @param {Array} tracks 
- * @param {String} spotifyToken 
- */
-let matchMultipleTracks = (tracks, spotifyToken) => {
-  return Promise.map(tracks, spotifyID => {
-    return SongMatch.findOne({spotifyID})
-      .then(result => {
-        if (!result) {
-          console.log("missing track", spotifyID)
-    
-          return getSpotifyTrackInfo(spotifyID, spotifyToken)
-          .then(trackinfo => {
-            const query = generateDataString(trackinfo);
-            return matchTrack(spotifyID, query, trackinfo.isrc)
-            .catch(err => { console.error(err) })
-          })
-          .catch(err => { console.error(err) })
-        }
-      })
-      .catch(err => { console.error(err) }) 
-    }, {concurrency: 1})
-}
+    addTagsAndStore(decryptedTrackBuffer, trackInfos, saveFilePath, albumCoverSavePath = null, numberRetry = 0) {
+        return new Promise((resolve, reject) => {
+            try {
+                let trackMetadata = {
+                    title: '',
+                    album: '',
+                    releaseType: '',
+                    genre: '',
+                    artists: [],
+                    albumArtist: '',
+                    trackNumber: '',
+                    trackNumberCombined: '',
+                    partOfSet: '',
+                    partOfSetCombined: '',
+                    label: '',
+                    copyright: '',
+                    composer: [],
+                    publisher: [],
+                    producer: [],
+                    engineer: [],
+                    writer: [],
+                    author: [],
+                    mixer: [],
+                    ISRC: '',
+                    duration: '',
+                    bpm: '',
+                    upc: '',
+                    explicit: '',
+                    tracktotal: '',
+                    disctotal: '',
+                    compilation: '',
+                    unsynchronisedLyrics: '',
+                    synchronisedLyrics: '',
+                    media: 'Digital Media',
+                };
 
-/**
- * request the spotifyAPItoken for a user using this application's API
- * 
- * @param {String} name
- * 
- * @returns spotifyAPItoken 
- */
-let getSpotifyToken = (name = 'Luc') => { // name should not be implied
-  return new Promise((resolve, reject) => {
-    axios.get(baseurl+'/api/spotify/gettoken?'+querystring.stringify({name}))
-    .then(response => { return resolve(response.data.token) })
-    .catch(err => { return reject(err) })
-  })
-}
+                if (trackInfos.SNG_TITLE_VERSION) trackMetadata.title = trackInfos.SNG_TITLE_VERSION;
+                if (trackInfos.ALB_TITLE) trackMetadata.album = trackInfos.ALB_TITLE;
+                if (trackInfos.ALB_ART_NAME) trackMetadata.albumArtist = trackInfos.ALB_ART_NAME;
+                if (trackInfos.DURATION) trackMetadata.duration = trackInfos.DURATION;
+                if (trackInfos.ALB_UPC) trackMetadata.upc = trackInfos.ALB_UPC;
 
-/**
- * returns info about track
- * 
- * @param {String} spotifyID trackID for spotify
- * @param {String} spotifyToken personal API token
- * 
- * @returns {Object} trackinfo
- */
-let getSpotifyTrackInfo = (spotifyID, spotifyToken) => {
-  return new Promise((resolve, reject) => {
-    axios.get('https://api.spotify.com/v1/tracks/'+spotifyID, {
-      headers: {Authorization: 'Bearer '+spotifyToken}
-    })
-    .then(response => { return resolve({title: response.data.name, artists: response.data.artists, isrc: response.data.external_ids.isrc}) })
-    .catch(err => { return reject(err) })
-  })
-}
+                if (trackInfos.ALB_RELEASE_TYPE) {
+                    let releaseType = trackInfos.ALB_RELEASE_TYPE;
 
-/**
- * generate the search query string for deezer
- * 
- * @param {Object} track contains title and array of artists
- * 
- * @returns {String} query for /api/match/advancedsearch route
- */
-let generateDataString = (track) => {
-  //remove any "featuring" and other extra's from trackname for better search results
-  let n = () => {
-    let bracket = track.title.indexOf(' ('),
-        dash = track.title.indexOf(' - ');
-    if (bracket > dash) {
-      return bracket;
-    } else {
-      return dash;
-    } 
-  }
+                    'ep' === releaseType ? releaseType = 'EP' : releaseType = this.capitalizeFirstLetter(releaseType);
 
-  let title = n(track.title) === -1 ? track.title : track.title.substring(0, n(track.title));
-   
-  let query = `track:"${title}" `;
+                    trackMetadata.releaseType = releaseType;
+                }
 
-  // add artists to search query
-  for (let i = 0; i < track.artists.length; i++) query += `artist:"${track.artists[i].name}" `;
-  
-  return query;
-}
+                if (trackInfos.ALB_GENRES && trackInfos.ALB_GENRES[0]) trackMetadata.genre = trackInfos.ALB_GENRES[0];
 
-/**
- * 
- * @param {string} spotifyID 
- * @param {Object} query 
- * @param {String} isrc 
- */
-let matchTrack = (spotifyID, query, isrc) => {
-  return new Promise((resolve, reject) => {
-    axios.get(baseurl+'/api/match/advancedsearch?'+querystring.stringify({query, spotifyID, isrc}))
-    .then(response => {
-      if (response.data.error) throw response.data.error;
-      return resolve();
-    })
-    .catch(err => { return reject(err) })
-  })
-}
+                if (trackInfos.TRACK_NUMBER) {
+                    trackMetadata.trackNumber = trackInfos.TRACK_NUMBER;
+                    trackMetadata.trackNumberCombined = trackInfos.TRACK_NUMBER;
+                }
 
-/**
- * get the title of a spotify playlist
- * 
- * @param {String} playlistID 
- * @param {String} spotifyToken 
- * 
- * @returns {String} the playlist title
- */
-getPlaylistTitle = (playlistID, spotifyToken) => {
-  return new Promise((resolve, reject) => {
-    axios.get(`https://api.spotify.com/v1/playlists/${playlistID}`, {
-      headers: {Authorization: 'Bearer '+spotifyToken}
-    })
-    .then(response => { return resolve(response.data.name) })
-    .catch(err => { return reject(err) })
-  })
-}
+                if (trackInfos.ALB_NUM_TRACKS) {
+                    trackMetadata.tracktotal = trackInfos.ALB_NUM_TRACKS;
+                    trackMetadata.trackNumberCombined += '/' + trackInfos.ALB_NUM_TRACKS;
+                }
 
-/**
- * get id from all tracks in a playlist
- * 
- * @param {String} playlistID 
- * @param {String} spotifyToken 
- * @param {Number} offset
- * @param {Array} tracks 
- * 
- * @returns {Array} array of trackIDs in the playlist
- */
-let getPlaylistTracks = (playlistID, spotifyToken, offset = 0, tracks = new Array) => {
-  return new Promise((resolve, reject) => {
-    axios.get(`https://api.spotify.com/v1/playlists/${playlistID}/tracks?`+querystring.stringify({limit: spotifyLimit, offset}), { // get trackID to update the playlist
-      headers: {Authorization: 'Bearer '+spotifyToken}
-    })
-    .then(response => {
-      for (let i = 0; i < response.data.items.length; i++) {
-        if (response.data.items[i].track) tracks.push(response.data.items[i].track.id); // for some weird reason 'track' can be null and results in a error here
-      }
+                if (trackInfos.DISK_NUMBER) {
+                    trackMetadata.partOfSet = trackInfos.DISK_NUMBER;
+                    trackMetadata.partOfSetCombined = trackInfos.DISK_NUMBER;
+                }
 
-      offset += spotifyLimit;
+                if (trackInfos.ALB_NUM_DISCS) {
+                    trackMetadata.disctotal = trackInfos.ALB_NUM_DISCS;
+                    trackMetadata.partOfSetCombined += '/' + trackInfos.ALB_NUM_DISCS;
+                }
 
-      if (response.data.items.length === spotifyLimit) {
-        getPlaylistTracks(playlistID, spotifyToken, offset, tracks)
-        .then(tracks => {
-          return resolve(tracks);
+                if (trackInfos.ALB_RELEASE_DATE || trackInfos.PHYSICAL_RELEASE_DATE) {
+                    let releaseDate = trackInfos.ALB_RELEASE_DATE;
+
+                    if (!trackInfos.ALB_RELEASE_DATE) releaseDate = trackInfos.PHYSICAL_RELEASE_DATE;
+
+                    trackMetadata.releaseYear = releaseDate.slice(0, 4);
+                    trackMetadata.releaseDate = releaseDate.slice(0, 10);
+                }
+
+                if (trackInfos.ALB_LABEL) trackMetadata.label = trackInfos.ALB_LABEL;
+                if (trackInfos.COPYRIGHT) trackMetadata.copyright = trackInfos.COPYRIGHT;
+                if (trackInfos.ISRC) trackMetadata.ISRC = trackInfos.ISRC;
+                if (trackInfos.BPM) trackMetadata.bpm = trackInfos.BPM;
+                if (trackInfos.EXPLICIT_LYRICS) trackMetadata.explicit = trackInfos.EXPLICIT_LYRICS;
+
+                if (trackInfos.ARTISTS) {
+                    let trackArtists = [];
+
+                    trackInfos.ARTISTS.forEach((trackArtist) => {
+                        if (trackArtist.ART_NAME) {
+                            trackArtist = trackArtist.ART_NAME.split(new RegExp(' featuring | feat. | Ft. | ft. | vs | vs. | x | - |, ', 'g'));
+                            trackArtist = trackArtist.map(Function.prototype.call, String.prototype.trim);
+
+                            trackArtists = trackArtists.concat(trackArtist);
+                        }
+                    });
+
+                    trackArtists = [...new Set(trackArtists)];
+                    trackMetadata.artists = trackArtists;
+                }
+
+                if (trackInfos.SNG_CONTRIBUTORS) {
+                    if (trackInfos.SNG_CONTRIBUTORS.composer) trackMetadata.composer = trackInfos.SNG_CONTRIBUTORS.composer;
+                    if (trackInfos.SNG_CONTRIBUTORS.musicpublisher) trackMetadata.publisher = trackInfos.SNG_CONTRIBUTORS.musicpublisher;
+                    if (trackInfos.SNG_CONTRIBUTORS.producer) trackMetadata.producer = trackInfos.SNG_CONTRIBUTORS.producer;
+                    if (trackInfos.SNG_CONTRIBUTORS.engineer) trackMetadata.engineer = trackInfos.SNG_CONTRIBUTORS.engineer;
+                    if (trackInfos.SNG_CONTRIBUTORS.writer) trackMetadata.writer = trackInfos.SNG_CONTRIBUTORS.writer;
+                    if (trackInfos.SNG_CONTRIBUTORS.author) trackMetadata.author = trackInfos.SNG_CONTRIBUTORS.author;
+                    if (trackInfos.SNG_CONTRIBUTORS.mixer) trackMetadata.mixer = trackInfos.SNG_CONTRIBUTORS.mixer;
+                }
+
+                'Various Artists' === trackMetadata.performerInfo ? trackMetadata.compilation = 1 : trackMetadata.compilation = 0;
+
+                //lyrics are allowed to be added to the metadata
+                if (trackInfos.LYRICS) {
+                    if (trackInfos.LYRICS.LYRICS_TEXT) trackMetadata.unsynchronisedLyrics = trackInfos.LYRICS.LYRICS_TEXT;
+
+                    if (trackInfos.LYRICS.LYRICS_SYNC_JSON) {
+                        const syncedLyrics = trackInfos.LYRICS.LYRICS_SYNC_JSON;
+
+                        for (let i = 0; i < syncedLyrics.length; i++) {
+                            if (syncedLyrics[i].lrc_timestamp) {
+                                trackMetadata.synchronisedLyrics += syncedLyrics[i].lrc_timestamp + syncedLyrics[i].line + '\r\n';
+                            } else if (i + 1 < syncedLyrics.length) {
+                                trackMetadata.synchronisedLyrics += syncedLyrics[i + 1].lrc_timestamp + syncedLyrics[i].line + '\r\n';
+                            }
+                        }
+                    }
+                }
+
+                let saveFilePathExtension = nodePath.extname(saveFilePath);
+
+                if ('.mp3' === saveFilePathExtension) {
+                    //screw those lyrics files
+                    /*if ('' !== trackMetadata.synchronisedLyrics.trim()) {
+                        const lyricsFile = saveFilePath.slice(0, -4) + '.lrc';
+
+                        that.ensureDir(lyricsFile);
+                        fs.writeFileSync(lyricsFile, trackMetadata.synchronisedLyrics);
+                    }*/
+
+                    const writer = new id3Writer(decryptedTrackBuffer);
+                    let coverBuffer;
+
+                    if (albumCoverSavePath && fs.existsSync(albumCoverSavePath)) coverBuffer = fs.readFileSync(albumCoverSavePath)
+
+                    writer
+                        .setFrame('TIT2', trackMetadata.title)
+                        .setFrame('TALB', trackMetadata.album)
+                        .setFrame('TCON', [trackMetadata.genre])
+                        .setFrame('TPE2', trackMetadata.albumArtist)
+                        .setFrame('TPE1', [trackMetadata.artists.join(', ')])
+                        .setFrame('TRCK', trackMetadata.trackNumberCombined)
+                        .setFrame('TPOS', trackMetadata.partOfSetCombined)
+                        .setFrame('TCOP', trackMetadata.copyright)
+                        .setFrame('TPUB', trackMetadata.publisher.join('/'))
+                        .setFrame('TMED', trackMetadata.media)
+                        .setFrame('TCOM', trackMetadata.composer)
+                        .setFrame('TXXX', {
+                            description: 'Artists',
+                            value: trackMetadata.artists.join('/')
+                        })
+                        .setFrame('TXXX', {
+                            description: 'RELEASETYPE',
+                            value: trackMetadata.releaseType
+                        })
+                        .setFrame('TSRC', trackMetadata.ISRC)
+                        .setFrame('TXXX', {
+                            description: 'BARCODE',
+                            value: trackMetadata.upc
+                        })
+                        .setFrame('TXXX', {
+                            description: 'LABEL',
+                            value: trackMetadata.label
+                        })
+                        .setFrame('TXXX', {
+                            description: 'LYRICIST',
+                            value: trackMetadata.writer.join('/')
+                        })
+                        .setFrame('TXXX', {
+                            description: 'MIXARTIST',
+                            value: trackMetadata.mixer.join('/')
+                        })
+                        .setFrame('TXXX', {
+                            description: 'INVOLVEDPEOPLE',
+                            value: trackMetadata.producer.concat(trackMetadata.engineer).join('/')
+                        })
+                        .setFrame('TXXX', {
+                            description: 'COMPILATION',
+                            value: trackMetadata.compilation
+                        })
+                        .setFrame('TXXX', {
+                            description: 'EXPLICIT',
+                            value: trackMetadata.explicit
+                        })
+                        .setFrame('TXXX', {
+                            description: 'SOURCE',
+                            value: 'Deezer'
+                        })
+                        .setFrame('TXXX', {
+                            description: 'SOURCEID',
+                            value: trackInfos.SNG_ID
+                        });
+
+                    if ('' !== trackMetadata.unsynchronisedLyrics) {
+                        writer.setFrame('USLT', {
+                            description: '',
+                            lyrics: trackMetadata.unsynchronisedLyrics
+                        });
+                    }
+
+                    if (coverBuffer) {
+                        writer.setFrame('APIC', {
+                            type: 3,
+                            data: coverBuffer,
+                            description: ''
+                        });
+                    }
+
+                    if (0 < parseInt(trackMetadata.releaseYear)) writer.setFrame('TYER', trackMetadata.releaseYear);
+                    if (0 < parseInt(trackMetadata.releaseDate)) writer.setFrame('TDAT', trackMetadata.releaseDate);
+                    if (0 < parseInt(trackMetadata.bpm)) writer.setFrame('TBPM', trackMetadata.bpm);
+
+                    writer.addTag();
+
+                    const taggedTrackBuffer = Buffer.from(writer.arrayBuffer);
+
+                    this.ensureDir(saveFilePath);
+                    fs.writeFileSync(saveFilePath, taggedTrackBuffer);
+
+                    return resolve();
+                } else if ('.flac' === saveFilePathExtension) {
+                    // I dont want seperate lyrics files
+                    /*if ('' !== trackMetadata.synchronisedLyrics.trim()) {
+                        const lyricsFile = saveFilePath.slice(0, -5) + '.lrc';
+
+                        that.ensureDir(lyricsFile);
+                        fs.writeFileSync(lyricsFile, trackMetadata.synchronisedLyrics);
+                    }*/
+
+                    let flacComments = [
+                        'SOURCE=Deezer',
+                        'SOURCEID=' + trackInfos.SNG_ID
+                    ];
+
+                    if ('' !== trackMetadata.title) flacComments.push('TITLE=' + trackMetadata.title);
+                    if ('' !== trackMetadata.album) flacComments.push('ALBUM=' + trackMetadata.album);
+                    if ('' !== trackMetadata.genre) flacComments.push('GENRE=' + trackMetadata.genre);
+                    if ('' !== trackMetadata.albumArtist) flacComments.push('ALBUMARTIST=' + trackMetadata.albumArtist);
+                    if (0 < trackMetadata.artists.length) flacComments.push('ARTIST=' + trackMetadata.artists.join(', '));
+                    if ('' !== trackMetadata.trackNumber) flacComments.push('TRACKNUMBER=' + trackMetadata.trackNumber);
+
+                    if ('' !== trackMetadata.tracktotal) {
+                        flacComments.push('TRACKTOTAL=' + trackMetadata.tracktotal);
+                        flacComments.push('TOTALTRACKS=' + trackMetadata.tracktotal);
+                    }
+
+                    if ('' !== trackMetadata.partOfSet) flacComments.push('DISCNUMBER=' + trackMetadata.partOfSet);
+
+                    if ('' !== trackMetadata.disctotal) {
+                        flacComments.push('DISCTOTAL=' + trackMetadata.disctotal);
+                        flacComments.push('TOTALDISCS=' + trackMetadata.disctotal);
+                    }
+
+                    if ('' !== trackMetadata.label) flacComments.push('LABEL=' + trackMetadata.label);
+                    if ('' !== trackMetadata.copyright) flacComments.push('COPYRIGHT=' + trackMetadata.copyright);
+                    if ('' !== trackMetadata.duration) flacComments.push('LENGTH=' + trackMetadata.duration)
+                    if ('' !== trackMetadata.ISRC) flacComments.push('ISRC=' + trackMetadata.ISRC);
+                    if ('' !== trackMetadata.upc) flacComments.push('BARCODE=' + trackMetadata.upc);
+                    if ('' !== trackMetadata.media) flacComments.push('MEDIA=' + trackMetadata.media);
+                    if ('' !== trackMetadata.compilation) flacComments.push('COMPILATION=' + trackMetadata.compilation);
+                    if ('' !== trackMetadata.explicit) flacComments.push('EXPLICIT=' + trackMetadata.explicit);
+
+                    if (trackMetadata.releaseType) flacComments.push('RELEASETYPE=' + trackMetadata.releaseType);
+
+                    trackMetadata.artists.forEach((artist) => {
+                        flacComments.push('ARTISTS=' + artist);
+                    });
+
+                    trackMetadata.composer.forEach((composer) => {
+                        flacComments.push('COMPOSER=' + composer);
+                    });
+
+                    trackMetadata.publisher.forEach((publisher) => {
+                        flacComments.push('ORGANIZATION=' + publisher);
+                    });
+
+                    trackMetadata.producer.forEach((producer) => {
+                        flacComments.push('PRODUCER=' + producer);
+                    });
+
+                    trackMetadata.engineer.forEach((engineer) => {
+                        flacComments.push('ENGINEER=' + engineer);
+                    });
+
+                    trackMetadata.writer.forEach((writer) => {
+                        flacComments.push('WRITER=' + writer);
+                    });
+
+                    trackMetadata.author.forEach((author) => {
+                        flacComments.push('AUTHOR=' + author);
+                    });
+
+                    trackMetadata.mixer.forEach((mixer) => {
+                        flacComments.push('MIXER=' + mixer);
+                    });
+
+                    if (trackMetadata.unsynchronisedLyrics) flacComments.push('LYRICS=' + trackMetadata.unsynchronisedLyrics);
+
+                    if (0 < parseInt(trackMetadata.releaseYear)) flacComments.push('YEAR=' + trackMetadata.releaseYear);
+                    if (0 < parseInt(trackMetadata.releaseDate)) flacComments.push('DATE=' + trackMetadata.releaseDate);
+                    if (0 < parseInt(trackMetadata.bpm)) flacComments.push('BPM=' + trackMetadata.bpm);
+
+                    const reader = new stream.PassThrough();
+                    reader.end(decryptedTrackBuffer);
+
+                    this.ensureDir(saveFilePath);
+
+                    const writer = fs.createWriteStream(saveFilePath);
+                    let processor = new flacMetadata.Processor({parseMetaDataBlocks: true});
+                    let vendor = 'reference libFLAC 1.2.1 20070917';
+                    let coverBuffer;
+
+                    if (albumCoverSavePath && fs.existsSync(albumCoverSavePath)) coverBuffer = fs.readFileSync(albumCoverSavePath);
+
+                    let mdbVorbisComment;
+                    let mdbVorbisPicture;
+
+                    processor.on('preprocess', (mdb) => {
+                        // Remove existing VORBIS_COMMENT and PICTURE blocks, if any.
+                        if (flacMetadata.Processor.MDB_TYPE_VORBIS_COMMENT === mdb.type) {
+                            mdb.remove();
+                        } else if (coverBuffer && flacMetadata.Processor.MDB_TYPE_PICTURE === mdb.type) {
+                            mdb.remove();
+                        }
+
+                        if (mdb.isLast) {
+                            mdbVorbisComment = flacMetadata.data.MetaDataBlockVorbisComment.create(!coverBuffer, vendor, flacComments);
+
+                            if (coverBuffer) mdbVorbisPicture = flacMetadata.data.MetaDataBlockPicture.create(true, 3, 'image/jpeg', '', 1400, 1400, 24, 0, coverBuffer);
+
+                            mdb.isLast = false;
+                        }
+                    });
+
+                    processor.on('postprocess', (mdb) => {
+                        if (flacMetadata.Processor.MDB_TYPE_VORBIS_COMMENT === mdb.type && null !== mdb.vendor) vendor = mdb.vendor;
+                        if (mdbVorbisComment) processor.push(mdbVorbisComment.publish());
+                        if (mdbVorbisPicture) processor.push(mdbVorbisPicture.publish());
+                    });
+
+                    reader.on('end', () => { return resolve() });
+
+                    reader.pipe(processor).pipe(writer);
+                }
+            } catch (err) {
+                if (numberRetry < 3) {
+                    numberRetry++;
+
+                    setTimeout(() => {
+                        this.addTagsAndStore(decryptedTrackBuffer, trackInfos, saveFilePath, albumCoverSavePath, numberRetry)
+                        .then(() => { resolve() })
+                        .catch(() => { reject() })
+                    }, 500);
+                } else {
+                    this.ensureDir(saveFilePath);
+                    fs.writeFileSync(saveFilePath, decryptedTrackBuffer);
+
+                    return reject();
+                }
+            }
         })
-      } else {
-        return resolve(tracks)
-      }
-    })
-    .catch(err => {
-      if (err.status === 401) {
-        getSpotifyToken()
-        .then(spotifyToken => {
-          return getPlaylistTracks(playlistID, spotifyToken, offset, tracks)
-        })
-      } else {
-        return reject(err); 
-      }  
-    })
-  })
+    }
+
+    /**
+     * Get alternative track for a song by its track infos.
+     *
+     * @param {Object} trackInfos
+     * @param {Number} token_nr token number for the arl/user to use
+     */
+    getTrackAlternative(trackInfos, token_nr) {
+        return new Promise((resolve, reject) => {
+            return axios.post(unofficialApiUrl+querystring.stringify(Object.assign({}, this.tokens[token_nr].unofficialApiQueries, { method: 'search.music', cid: this.getApiCid() })), {QUERY: 'artist:\'' + trackInfos.ART_NAME + '\' track:\'' + trackInfos.SNG_TITLE + '\'', OUTPUT: 'TRACK', NB: 50, FILTER: 0}, this.tokens[token_nr].config)
+            .then(async response => {
+                if (response && 0 === Object.keys(response.data.error).length && response.data.results && response.data.results.data && 0 > response.data.results.data.length) {
+                    const foundTracks = response.data.results.data;
+                    let matchingTracks = [];
+                    if (foundTracks.length > 0) {
+                        foundTracks.forEach(foundTrack => { if (trackInfos.MD5_ORIGIN === foundTrack.MD5_ORIGIN && trackInfos.DURATION - 5 <= foundTrack.DURATION && trackInfos.DURATION + 10 >= foundTrack.DURATION) matchingTracks.push(foundTrack) });
+
+                        if (1 === matchingTracks.length) {
+                            return resolve(matchingTracks[0]);
+                        } else {
+                            let foundAlternativeTrack = false;
+
+                            if (0 === matchingTracks.length) {
+                                foundTracks.forEach((foundTrack) => { if (trackInfos.MD5_ORIGIN === foundTrack.MD5_ORIGIN) matchingTracks.push(foundTrack) });
+                            }
+
+                            matchingTracks.forEach((foundTrack) => {
+                                foundTrack.SNG_TITLE_VERSION = foundTrack.SNG_TITLE;
+
+                                if (foundTrack.VERSION) {
+                                    foundTrack.SNG_TITLE_VERSION = (foundTrack.SNG_TITLE + ' ' + foundTrack.VERSION).trim();
+                                }
+
+                                if (this.removeWhitespacesAndSpecialChars(trackInfos.SNG_TITLE_VERSION).toLowerCase() === this.removeWhitespacesAndSpecialChars(foundTrack.SNG_TITLE_VERSION).toLowerCase()) {
+                                    foundAlternativeTrack = true;
+
+                                    return resolve(foundTrack);
+                                }
+                            });
+
+                            if (!foundAlternativeTrack) return reject("did not find alternative track");
+                        }
+                    } else {
+                        return reject("did not find alternative track");
+                    }
+                } else if (response.data.error.VALID_TOKEN_REQUIRED) {
+                    await this.initAPI(token_nr);
+
+                    this.getTrackAlternative(trackInfos)
+                    .then(alternativeTrackInfos => { return resolve(alternativeTrackInfos) })
+                    .catch(err => { return reject(err) });
+                } else {
+                    return reject("did not find alternative track");
+                }
+            }).catch(() => {
+                return reject("did not receive response");
+            });
+        });
+    }
 }
 
-/**
- * Update the playlist in database, the trackID and playlistTitle should be retrieved using getPlaylistTracks()
- * 
- * @param {Array} trackID 
- * @param {String} playlistTitle 
- * @param {String} playlistID
- */
-let storePlaylistToDB = (trackID, playlistTitle, playlistID) => {
-  return new Promise((resolve, reject) => {
-    axios.post(baseurl+'/api/match/storeplaylist', {
-      trackID, playlistTitle, playlistID
-    })
-    .then(response => {
-      if (response.data.error) throw response.data.error;
-      return resolve()
-    })
-    .catch(err => { return reject(err) })
-  })
-}
-
-/**
- * Download the track from deezer that belongs to the spotifyID
- * 
- * @param {String} spotifyID 
- * @param {String} playlistID 
- */
-let sendTrackToAPI = (spotifyID, playlistID, playlistTitle) => {
-  return new Promise(resolve => {
-    SongMatch.findOne({spotifyID})
-    .then(async result => {
-      if (!result) return resolve();
-
-      let deezerID = result.deezerID;
-
-      const exists = await doesTrackExist(result, playlistTitle);
-      if (exists) return resolve()
-
-      if (deezerID === "badmatch") return resolve(); // its known this track is not available 
-
-      axios.get(baseurl+'/api/download/track?'+querystring.stringify({deezerID, playlistID}))
-      .then(result => {
-        if (result.data.error) throw result.data.error
-
-        return resolve()
-      })
-      .catch(err => {
-        if (!err.includes(deezerID)) console.error(err)
-
-        return resolve()
-      })
-    })
-  })
-}
-
-setTimeout(syncPlaylist, 15 * 1000); // wait 15 seconds before starting sync
-setInterval(syncPlaylist, 15 * 60 * 1000); // run function every 15 minutes, use clearInterval(interval) to stop
-
-module.exports = router;
+let smloadr = new smloadrClass;
+module.exports = smloadr; // default export
